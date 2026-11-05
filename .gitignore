@@ -1,0 +1,4 @@
+# Data files
+extracted_fit/
+*.fit
+*.json
