@@ -1,4 +1,13 @@
 # Data files
 extracted_fit/
 *.fit
+
+# Ignore data json dumps, but keep agent configs
 *.json
+!/.agents/**/*.json
+!/.agents/mcp_config.json
+
+# Local secrets & environment files
+.env
+*.key
+connect-personal-api-key
