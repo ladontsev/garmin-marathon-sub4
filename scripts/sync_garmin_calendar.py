@@ -3,7 +3,7 @@
 """
 Garmin Workout & Calendar Synchronizer
 Парсит тренировки из CALENDAR.md, создает структурированные беговые тренировки 
-в Garmin Connect и планирует их в календаре Garmin с поддержкой умного обновления и очистки.
+в Garmin Connect и планирует их в календаре Garmin с защитой ручных записей пользователя.
 """
 
 import os
@@ -32,6 +32,21 @@ except ImportError:
     sys.exit(1)
 
 DEFAULT_TOKEN_DIR = Path.home() / ".config" / "garmin" / "tokens"
+PLAN_TAG = "[Sub4]"
+
+
+def is_plan_workout(item: dict) -> bool:
+    """
+    Проверяет, принадлежит ли запланированная тренировка нашему плану марафона Sub-4.
+    Любые личные или ручные записи пользователя (силовые, плавание, другие пробежки)
+    не содержат этот маркер и НЕ будут затронуты при синхронизации!
+    """
+    name = item.get("workoutName") or ""
+    if PLAN_TAG in name:
+        return True
+    # Поддержка начального формата 'Вт -', 'Чт -', 'Пт -'
+    days_prefix = ("Вт -", "Чт -", "Пт -", "Вс -")
+    return name.startswith(days_prefix)
 
 
 def parse_calendar(calendar_path: str = "CALENDAR.md") -> list[dict]:
@@ -70,7 +85,7 @@ def parse_calendar(calendar_path: str = "CALENDAR.md") -> list[dict]:
 
 
 def build_running_workout(w: dict) -> RunningWorkout | None:
-    """Создает структурированную тренировку для Garmin Connect"""
+    """Создает структурированную тренировку для Garmin Connect с тегом [Sub4]"""
     dist_km = w["dist_km"]
     wtype = w["type"]
     desc = w["description"]
@@ -78,8 +93,9 @@ def build_running_workout(w: dict) -> RunningWorkout | None:
     if dist_km <= 0 or "ОТДЫХ" in wtype or "—" in w["raw_dist"]:
         return None
 
-    title = f"{w['day']} - {wtype[:20]} ({dist_km}k)"
-    clean_title = re.sub(r'[^\w\s\-\.\(\)\/]', '', title).strip()
+    # Добавляем защитный тег PLAN_TAG, чтобы отличать тренировки плана от ручных записей
+    title = f"{PLAN_TAG} {w['day']} - {wtype[:15]} ({dist_km}k)"
+    clean_title = re.sub(r'[^\w\s\-\.\(\)\[\]\/]', '', title).strip()
 
     steps = []
     step_order = 1
@@ -206,14 +222,13 @@ def get_garmin_client(token_dir: Path, email: str | None = None, password: str |
 
 
 def fetch_existing_scheduled(client: Garmin, start_str: str, end_str: str) -> dict[str, list[dict]]:
-    """Получает словарь уже запланированных тренировок по датам { 'YYYY-MM-DD': [items...] }"""
+    """Получает словарь уже запланированных тренировок по датам"""
     try:
         items = client.get_scheduled_workouts_by_period(start_str, end_str)
         by_date = {}
         for item in items or []:
             d = item.get("calendarDate") or item.get("date")
             if d:
-                # Format to YYYY-MM-DD
                 d_clean = d[:10]
                 by_date.setdefault(d_clean, []).append(item)
         return by_date
@@ -227,7 +242,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Только показать тренировки без отправки в Garmin")
     parser.add_argument("--weeks", type=int, default=4, help="Количество недель для синхронизации вперед (по умолчанию 4)")
     parser.add_argument("--all", action="store_true", help="Синхронизировать весь план до сентября 2027 г.")
-    parser.add_argument("--clear", action="store_true", help="Очистить запланированные тренировки в Garmin за указанный период")
+    parser.add_argument("--clear", action="store_true", help="Очистить тренировки плана Sub-4 в Garmin за указанный период (ручные записи НЕ трогаются)")
     parser.add_argument("--start-date", type=str, help="Начальная дата (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="Конечная дата (YYYY-MM-DD)")
     parser.add_argument("--token-dir", type=str, default=str(DEFAULT_TOKEN_DIR), help="Папка хранения токенов")
@@ -261,7 +276,8 @@ def main():
         for w in filtered:
             workout_obj = build_running_workout(w)
             status = "🏃 Бег" if workout_obj else "🧘 Отдых/Старт"
-            print(f"  • {w['date_str']} ({w['day']}) | {status} | {w['type']} ({w['raw_dist']})")
+            name = workout_obj.to_dict()['workoutName'] if workout_obj else "Отдых"
+            print(f"  • {w['date_str']} ({w['day']}) | {status} | {name} ({w['raw_dist']})")
         print("\n[DRY RUN] Готово. Никаких изменений в Garmin не внесено.")
         return
 
@@ -269,28 +285,33 @@ def main():
     token_path = Path(args.token_dir)
     client = get_garmin_client(token_path)
 
-    # 1. Получаем текущее расписание из Garmin
     print(f"🔎 Запрос существующих записей календаря Garmin с {start_str} по {end_str}...")
     existing_by_date = fetch_existing_scheduled(client, start_str, end_str)
 
-    # Режим очистки (если вызван с --clear)
+    # Режим очистки (только для тренировок плана Sub-4!)
     if args.clear:
-        print("\n🧹 Режим очистки (--clear): удаление тренировок из календаря...")
+        print("\n🧹 Режим очистки (--clear): удаление тренировок плана [Sub-4] из календаря...")
         cleared_count = 0
         for d, items in existing_by_date.items():
             for item in items:
-                sched_id = item.get("workoutScheduleId") or item.get("scheduleId")
                 name = item.get("workoutName") or "Workout"
+                sched_id = item.get("workoutScheduleId") or item.get("scheduleId")
+                
+                # Защита ручных записей!
+                if not is_plan_workout(item):
+                    print(f"  🔒 {d}: Пропуск ручной тренировки '{name}' (остается в календаре)")
+                    continue
+
                 if sched_id:
                     print(f"  🗑 Удаление из {d}: {name} (ID: {sched_id})...", end=" ")
                     client.unschedule_workout(sched_id)
                     print("✅ Снято.")
                     cleared_count += 1
-        print(f"\n🎉 Очистка завершена! Снято тренировок: {cleared_count}.")
+        print(f"\n🎉 Очистка завершена! Снято тренировок плана: {cleared_count}. Все ваши ручные записи сохранены.")
         return
 
-    # Умная синхронизация: удаление устаревших и загрузка обновленных
-    print("\n⚡ Синхронизация календаря (умная замена устаревших тренировок)...")
+    # Умная синхронизация
+    print("\n⚡ Синхронизация календаря (с защитой личных тренировок)...")
     updated_count = 0
 
     for w in filtered:
@@ -298,39 +319,46 @@ def main():
         workout_obj = build_running_workout(w)
         existing_items = existing_by_date.get(date_str, [])
 
-        # Если день отдыха/соревнований, но в Garmin висит старая тренировка — снимаем её
+        # Если по плану отдых/соревнование, но висит старая тренировка плана Sub-4 — снимаем только её!
         if not workout_obj:
             for item in existing_items:
-                sched_id = item.get("workoutScheduleId") or item.get("scheduleId")
-                if sched_id:
-                    print(f"  🧹 {date_str}: День отдыха. Снятие старой тренировки ({sched_id})...", end=" ")
-                    client.unschedule_workout(sched_id)
-                    print("✅")
+                if is_plan_workout(item):
+                    sched_id = item.get("workoutScheduleId") or item.get("scheduleId")
+                    if sched_id:
+                        print(f"  🧹 {date_str}: День отдыха. Снятие старой тренировки плана ({sched_id})...", end=" ")
+                        client.unschedule_workout(sched_id)
+                        print("✅")
+                else:
+                    print(f"  🔒 {date_str}: Найдена ваша личная запись '{item.get('workoutName')}' — не трогаем.")
             continue
 
         workout_dict = workout_obj.to_dict()
         new_name = workout_dict["workoutName"]
 
-        # Если на этот день уже стоит тренировка:
-        # Проверяем, совпадает ли она. Если нет или если план изменился — снимаем старую!
+        # Проверяем записи на этот день
         need_reschedule = True
         for item in existing_items:
             old_name = item.get("workoutName") or ""
             sched_id = item.get("workoutScheduleId") or item.get("scheduleId")
-            
-            # Если имя совпадает в точности, тренировка уже актуальна
+
+            # 1. Если это личная/ручная запись пользователя — СТРОГО НЕ ТРОГАЕМ!
+            if not is_plan_workout(item):
+                print(f"  🔒 {date_str}: Найдена ваша личная тренировка '{old_name}' — оставляем нетронутой.")
+                continue
+
+            # 2. Если это тренировка плана Sub-4:
             if old_name == new_name:
-                print(f"  ⏭ {date_str}: {new_name} уже в календаре Garmin (без изменений).")
+                print(f"  ⏭ {date_str}: {new_name} уже в календаре (актуальна).")
                 need_reschedule = False
                 break
             else:
-                # План изменился! Снимаем старую версию
+                # План изменился — снимаем старую версию плана
                 if sched_id:
-                    print(f"  🔄 {date_str}: План изменился! Снятие старой версии '{old_name}'...", end=" ")
+                    print(f"  🔄 {date_str}: Обновление плана. Снятие старой версии '{old_name}'...", end=" ")
                     client.unschedule_workout(sched_id)
                     print("✅")
 
-        # Загружаем и назначаем обновленную тренировку
+        # Назначаем новую тренировку
         if need_reschedule:
             try:
                 print(f"  ⏳ Загрузка: {date_str} - {new_name}...", end=" ", flush=True)
@@ -345,8 +373,8 @@ def main():
             except Exception as e:
                 print(f"❌ Ошибка: {e}")
 
-    print(f"\n🎉 Синхронизация завершена! Внесено/обновлено тренировок: {updated_count}.")
-    print("Откройте часы или приложение Garmin Connect для обновления.")
+    print(f"\n🎉 Синхронизация завершена! Внесено/обновлено тренировок плана: {updated_count}.")
+    print("Ваши личные записи, события и тренировки остались в полной сохранности!")
 
 
 if __name__ == "__main__":
